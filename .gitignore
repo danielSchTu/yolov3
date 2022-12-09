@@ -25,6 +25,7 @@
 
 storage.googleapis.com
 runs/*
+runs*
 data/*
 !data/hyps/*
 !data/images/zidane.jpg
@@ -32,11 +33,13 @@ data/*
 !data/*.sh
 
 results*.csv
+*.csv
 
 # Datasets -------------------------------------------------------------------------------------------------------------
 coco/
 coco128/
 VOC/
+pcb_tiled*
 
 # MATLAB GitIgnore -----------------------------------------------------------------------------------------------------
 *.m~
@@ -148,6 +151,7 @@ celerybeat-schedule
 .venv*
 venv*/
 ENV*/
+env*
 
 # Spyder project settings
 .spyderproject

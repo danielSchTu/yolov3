@@ -55,6 +55,9 @@ RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
 
+import EfficientConvBNQuantization.model
+import collections
+
 def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt,
           device,
@@ -96,7 +99,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Config
     plots = not evolve  # create plots
-    cuda = device.type != 'cpu'
+    cuda = False #device.type != 'cpu'
     init_seeds(1 + RANK)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
@@ -129,6 +132,26 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if any(x in k for x in freeze):
             LOGGER.info(f'freezing {k}')
             v.requires_grad = False
+    
+
+    #freeze weights
+    # for k, v in model.named_parameters():
+    #     # LOGGER.info(f'possible {k}')
+    #     if '.weight' in k:
+    #         LOGGER.info(f'freezing {k}')
+    #         v.requires_grad = False
+    #     # if '.weight' in k:
+    #     #     LOGGER.info(f'freezing {k}')
+    #     #     v.requires_grad = False
+    #     if '.bias' in k:
+    #         LOGGER.info(f'freezing {k}')
+    #         v.requires_grad = False
+    
+    def unfreeze(model):
+        for k, v in model.named_parameters():
+            LOGGER.info(f'unfreezing {k}')
+            v.requires_grad = True
+
 
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
@@ -152,6 +175,10 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             g0.append(v.weight)
         elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
             g1.append(v.weight)
+        elif hasattr(v,'alpha') and isinstance(v.alpha, nn.Parameter):
+            g1.append(v.alpha)
+
+
 
     if opt.adam:
         optimizer = Adam(g0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
@@ -159,6 +186,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         optimizer = SGD(g0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
 
     optimizer.add_param_group({'params': g1, 'weight_decay': hyp['weight_decay']})  # add g1 with weight_decay
+    # optimizer.add_param_group({'params': g1}) 
     optimizer.add_param_group({'params': g2})  # add g2 (biases)
     LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
                 f"{len(g0)} weight, {len(g1)} weight (no decay), {len(g2)} bias")
@@ -169,7 +197,27 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     else:
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+    def cos_restart(x,cycles,y1,y2):
+        # if x<10:
+        #     # return 10
+        #     return (1-x/10)*10 + (x/10)*y2
+        # ranges = [i*i for i in range(1,cycles+1)]
+        ranges = [i for i in range(1,cycles+1)]
+        steps = epochs/sum(ranges)
+        i=0
+        while x-steps*ranges[i]>0:
+            x = x-steps*ranges[i]
+            i+=1
+        # if EfficientConvBNQuantization.model.__TESTING_FLAGS__['FREEZE_BN'] and x<130:
+        #     return 0.1*(((1 - math.cos(x * math.pi / (steps*ranges[i]))) / 2) * (y2 - y1) + y1)
+        # elif x>=130 and x<140:
+        #     return ((x-130)/10*(0.9)+0.1)*(((1 - math.cos(x * math.pi / (steps*ranges[i]))) / 2) * (y2 - y1) + y1)
+        return ((1 - math.cos(x * math.pi / (steps*ranges[i]))) / 2) * (y2 - y1) + y1
+
+    # lambda x : cos_restart(x,2,1, hyp['lrf'])
+
+    # scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x : cos_restart(x,1,1, hyp['lrf']))  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
     ema = ModelEMA(model) if RANK in [-1, 0] else None
@@ -178,13 +226,13 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     start_epoch, best_fitness = 0, 0.0
     if pretrained:
         # Optimizer
-        if ckpt['optimizer'] is not None:
-            optimizer.load_state_dict(ckpt['optimizer'])
-            best_fitness = ckpt['best_fitness']
+        # if ckpt['optimizer'] is not None:
+        #     optimizer.load_state_dict(ckpt['optimizer'])
+        #     best_fitness = ckpt['best_fitness']
 
         # EMA
         if ema and ckpt.get('ema'):
-            ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
+            ema.ema.load_state_dict(ckpt['ema'].float().state_dict(),strict=False)
             ema.updates = ckpt['updates']
 
         # Epochs
@@ -235,7 +283,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Anchors
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
-            model.half().float()  # pre-reduce anchor precision
+            model.float()  # pre-reduce anchor precision
 
         callbacks.run('on_pretrain_routine_end')
 
@@ -257,6 +305,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
+    # nw = 0
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
@@ -269,7 +318,44 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+
+
+    bs_data = None
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        # if epoch == 10:
+        #     unfreeze(model)
+        # if epoch % 10 == 0 or epoch==45:
+        #     ckpt = {'epoch': epoch,
+        #                 'best_fitness': best_fitness,
+        #                 'model': deepcopy(de_parallel(model)),
+        #                 'ema': deepcopy(ema.ema),
+        #                 'updates': ema.updates,
+        #                 'optimizer': optimizer.state_dict(),
+        #                 'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
+        #                 'date': datetime.now().isoformat()}
+
+        #         # Save last, best and delete
+        #     torch.save(ckpt, w / f'epoch_{epoch}.pt')
+        # if epoch == 100:
+        #     print('freezing Bn statistics')
+        #     EfficientConvBNQuantization.model.__TESTING_FLAGS__['FREEZE_BN']=True
+        #     # EfficientConvBNQuantization.model.__TESTING_FLAGS__['FREEZE_WEIGHT_QUANT']=True
+            # print('freezing Weights statistics')
+
+            # EfficientConvBNQuantization.model.__TESTING_FLAGS__['FUZE_BN']=True
+            # optimizer.state = collections.defaultdict(dict)
+            # for group in optimizer.param_groups:
+            #     for p in group['params']:
+            #         if p.grad is not None:
+            #             state = optimizer.state[p]
+            #             if 'momentum_buffer' not in state:
+            #                 pass
+            #             else:
+            #                 optimizer.state[p]['momentum_buffer']=torch.zeros_like(state['momentum_buffer'])
+
+        # # if epoch == 100:
+        # #     EfficientConvBNQuantization.model.__TESTING_FLAGS__['FUZE_BN']=False
+        
         model.train()
 
         # Update image weights (optional, single-GPU only)
@@ -291,8 +377,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             pbar = tqdm(pbar, total=nb, ncols=NCOLS, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+
+            
+
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+
+            if bs_data is None:
+                bs_data = torch.rand_like(imgs).clamp(0,1)
 
             # Warmup
             if ni <= nw:
@@ -323,6 +415,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     loss *= 4.
 
             # Backward
+            # if not EfficientConvBNQuantization.model.__TESTING_FLAGS__['FREEZE_BN'] or epoch>110:
             scaler.scale(loss).backward()
 
             # Optimize
@@ -348,6 +441,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         scheduler.step()
 
         if RANK in [-1, 0]:
+            model.eval()
+            # model(bs_data)
+            model.train()
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
@@ -357,12 +453,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            batch_size=batch_size // WORLD_SIZE * 2,
                                            imgsz=imgsz,
                                            model=ema.ema,
+                                        #    model=model,
                                            single_cls=single_cls,
                                            dataloader=val_loader,
                                            save_dir=save_dir,
                                            plots=False,
                                            callbacks=callbacks,
-                                           compute_loss=compute_loss)
+                                           compute_loss=compute_loss,
+                                           half = False)
+
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -375,8 +474,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
-                        'model': deepcopy(de_parallel(model)).half(),
-                        'ema': deepcopy(ema.ema).half(),
+                        'model': deepcopy(de_parallel(model)),
+                        'ema': deepcopy(ema.ema),
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
@@ -417,7 +516,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     results, _, _ = val.run(data_dict,
                                             batch_size=batch_size // WORLD_SIZE * 2,
                                             imgsz=imgsz,
-                                            model=attempt_load(f, device).half(),
+                                            model=attempt_load(f, device),
                                             iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
                                             single_cls=single_cls,
                                             dataloader=val_loader,
@@ -426,7 +525,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                             verbose=True,
                                             plots=True,
                                             callbacks=callbacks,
-                                            compute_loss=compute_loss)  # val best model with plots
+                                            compute_loss=compute_loss,
+                                            half=False)  # val best model with plots
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 

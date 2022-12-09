@@ -1,0 +1,42 @@
+# YOLOv3 🚀 by Ultralytics, GPL-3.0 license
+
+# Parameters
+nc: 14  # number of classes
+depth_multiple: 1.0  # model depth multiple
+width_multiple: 1.0  # layer channel multiple
+anchors:
+  - [10,14, 23,27, 37,58]  # P4/16
+  - [81,82, 135,169, 344,319]  # P5/32
+
+# YOLOv3-tiny backbone
+backbone:
+  # [from, number, module, args]
+  [[-1, 1, Start, []],  # 0
+   [-1, 1, ConvQAT, [16, 3, 1]],  # 1
+   [-1, 1, MaxPool2d, [2, 2, 0]],  # 2-P1/2
+   [-1, 1, ConvQAT, [32, 3, 1]],
+   [-1, 1, MaxPool2d, [2, 2, 0]],  # 4-P2/4
+   [-1, 1, ConvQAT, [64, 3, 1]],
+   [-1, 1, MaxPool2d, [2, 2, 0]],  # 6-P3/8
+   [-1, 1, ConvQAT, [128, 3, 1]],
+   [-1, 1, MaxPool2d, [2, 2, 0]],  # 8-P4/16
+   [-1, 1, ConvQAT, [256, 3, 1]],
+   [-1, 1, MaxPool2d, [2, 2, 0]],  # 10-P5/32
+   [-1, 1, ConvQAT, [512, 3, 1]],
+   [-1, 1, ZeroPad2d, [[0, 1, 0, 1]]],  # 12
+   [-1, 1, MaxPool2d, [2, 1, 0]],  # 13
+  ]
+
+# YOLOv3-tiny head
+head:
+  [[-1, 1, ConvQAT, [1024, 3, 1]],
+   [-1, 1, ConvQAT, [256, 1, 1]],
+   [-1, 1, ConvQAT, [512, 3, 1,None,1,True,False]],  # 16 (P5/32-large)
+
+   [-2, 1, ConvQAT, [128, 1, 1]],
+   [-1, 1, Upsample, [None, 2, 'nearest']],
+   [[-1, 9], 1, ConcatQAT, [1]],  # cat backbone P4
+   [-1, 1, ConvQAT, [256, 3, 1,None,1,True,False]],  # 20 (P4/16-medium)
+
+   [[20, 16], 1, DetectQAT, [nc, anchors]],  # Detect(P4, P5)
+  ]
